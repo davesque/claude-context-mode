@@ -126,7 +126,8 @@ Use context-mode for ANY of these, without being asked:
 ## Search Query Strategy
 
 - BM25 uses **OR semantics** — results matching more terms rank higher automatically
-- Use 2-4 specific technical terms per query
+- Use 2-4 specific technical terms per query for keyword search
+- Semantic/natural language queries also work well when QMD is available (e.g. "how does authentication work"). Both styles are valid.
 - **Always use `source` parameter** when multiple docs are indexed to avoid cross-source contamination
   - Partial match works: `source: "Node"` matches `"Node.js v22 CHANGELOG"`
 - **Always use `queries` array** — batch ALL search questions in ONE call:
@@ -203,7 +204,7 @@ Step 1: browser_snapshot(filename: "/tmp/playwright-snapshot.md")
         → saves to file, returns ~50B confirmation (NOT 135K tokens)
 
 Step 2: index(path: "/tmp/playwright-snapshot.md", source: "Playwright snapshot")
-        → reads file SERVER-SIDE, indexes into FTS5, returns ~80B confirmation
+        → reads file SERVER-SIDE, indexes into search backend, returns ~80B confirmation
 
 Step 3: search(queries: ["login form email password"], source: "Playwright")
         → returns only matching chunks (~300B)

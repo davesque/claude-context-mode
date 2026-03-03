@@ -3,8 +3,10 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createRequire } from "node:module";
 import { z } from "zod";
+import { randomUUID } from "node:crypto";
 import { PolyglotExecutor } from "./executor.js";
 import { ContentStore, cleanupStaleDBs, type SearchResult } from "./store.js";
+import { QmdClient, type QmdSearchResult } from "./qmd-client.js";
 import {
   detectRuntimes,
   getRuntimeSummary,
@@ -31,6 +33,12 @@ function getStore(): ContentStore {
   if (!_store) _store = new ContentStore();
   return _store;
 }
+
+// QMD hybrid search integration — delegates index/search to QMD daemon when available
+const QMD_URL = process.env.QMD_URL || "http://localhost:8181";
+const qmdSessionId = randomUUID();
+const qmdClient = new QmdClient(QMD_URL, qmdSessionId);
+let qmdAvailable = false;
 
 // ─────────────────────────────────────────────────────────
 // Session stats — track context consumption per tool
@@ -230,7 +238,7 @@ server.registerTool(
         .optional()
         .describe(
           "What you're looking for in the output. When provided and output is large (>5KB), " +
-          "indexes output into knowledge base and returns section titles + previews — not full content. " +
+          "indexes output into hybrid search backend and returns section titles + previews — not full content. " +
           "Use search(queries: [...]) to retrieve specific sections. Example: 'failing tests', 'HTTP 500 errors'." +
           "\n\nTIP: Use specific technical terms, not just concepts. Check 'Searchable terms' in the response for available vocabulary.",
         ),
@@ -281,7 +289,7 @@ if(__cm_net>0)process.stderr.write('__CM_NET__:'+__cm_net+'\\n');
           trackIndexed(Buffer.byteLength(output));
           return trackResponse("execute", {
             content: [
-              { type: "text" as const, text: intentSearch(output, intent, `execute:${language}:error`) },
+              { type: "text" as const, text: await intentSearch(output, intent, `execute:${language}:error`) },
             ],
             isError: true,
           });
@@ -301,7 +309,7 @@ if(__cm_net>0)process.stderr.write('__CM_NET__:'+__cm_net+'\\n');
         trackIndexed(Buffer.byteLength(stdout));
         return trackResponse("execute", {
           content: [
-            { type: "text" as const, text: intentSearch(stdout, intent, `execute:${language}`) },
+            { type: "text" as const, text: await intentSearch(stdout, intent, `execute:${language}`) },
           ],
         });
       }
@@ -324,49 +332,66 @@ if(__cm_net>0)process.stderr.write('__CM_NET__:'+__cm_net+'\\n');
 );
 
 // ─────────────────────────────────────────────────────────
-// Helper: index stdout into FTS5 knowledge base
-// ─────────────────────────────────────────────────────────
-
-function indexStdout(
-  stdout: string,
-  source: string,
-): { content: Array<{ type: "text"; text: string }> } {
-  const store = getStore();
-  trackIndexed(Buffer.byteLength(stdout));
-  const indexed = store.index({ content: stdout, source });
-  return {
-    content: [
-      {
-        type: "text" as const,
-        text: `Indexed ${indexed.totalChunks} sections (${indexed.codeChunks} with code) from: ${indexed.label}\nUse search(queries: ["..."]) to query this content. Use source: "${indexed.label}" to scope results.`,
-      },
-    ],
-  };
-}
-
-// ─────────────────────────────────────────────────────────
 // Helper: intent-driven search on execution output
 // ─────────────────────────────────────────────────────────
 
 const INTENT_SEARCH_THRESHOLD = 5_000; // bytes — ~80-100 lines
 
-function intentSearch(
+async function intentSearch(
   stdout: string,
   intent: string,
   source: string,
   maxResults: number = 5,
-): string {
+): Promise<string> {
   const totalLines = stdout.split("\n").length;
   const totalBytes = Buffer.byteLength(stdout);
 
-  // Index into the PERSISTENT store so user can search() later
+  // QMD path: index + search via hybrid pipeline
+  if (qmdAvailable) {
+    try {
+      const indexResult = await qmdClient.index(stdout, source);
+      let searchResults = await qmdClient.search([intent], { limit: maxResults });
+
+      // Scope to just-indexed document (source substring matches "source:N" keys)
+      const sourceLower = source.toLowerCase();
+      searchResults = searchResults.filter(r =>
+        r.file.toLowerCase().includes(sourceLower)
+      );
+
+      if (searchResults.length === 0) {
+        return [
+          `Indexed "${source}" into QMD.`,
+          `No sections matched intent "${intent}" in ${totalLines}-line output (${(totalBytes / 1024).toFixed(1)}KB).`,
+          "",
+          "Use search() to explore the indexed content.",
+        ].join("\n");
+      }
+
+      const lines = [
+        `Indexed "${source}" into QMD.`,
+        `${searchResults.length} sections matched "${intent}" (${totalLines} lines, ${(totalBytes / 1024).toFixed(1)}KB):`,
+        "",
+      ];
+
+      for (const r of searchResults) {
+        const preview = r.snippet.split("\n")[0].slice(0, 120);
+        lines.push(`  - ${r.title}: ${preview}`);
+      }
+
+      lines.push("");
+      lines.push("Use search(queries: [...]) to retrieve full content of any section.");
+      return lines.join("\n");
+    } catch (err) {
+      console.error("QMD intentSearch failed, falling back to local:", err);
+    }
+  }
+
+  // Fallback: local FTS5 store
   const persistent = getStore();
   const indexed = persistent.indexPlainText(stdout, source);
 
-  // Search the persistent store directly (porter → trigram → fuzzy)
   let results = persistent.searchWithFallback(intent, maxResults, source);
 
-  // Extract distinctive terms as vocabulary hints for the LLM
   const distinctiveTerms = persistent.getDistinctiveTerms(indexed.sourceId);
 
   if (results.length === 0) {
@@ -383,7 +408,6 @@ function intentSearch(
     return lines.join("\n");
   }
 
-  // Return ONLY titles + first-line previews — not full content
   const lines = [
     `Indexed ${indexed.totalChunks} sections from "${source}" into knowledge base.`,
     `${results.length} sections matched "${intent}" (${totalLines} lines, ${(totalBytes / 1024).toFixed(1)}KB):`,
@@ -450,7 +474,7 @@ server.registerTool(
         .optional()
         .describe(
           "What you're looking for in the output. When provided and output is large (>5KB), " +
-          "returns only matching sections via BM25 search instead of truncated output.",
+          "returns only matching sections via hybrid search instead of truncated output.",
         ),
     }),
   },
@@ -481,7 +505,7 @@ server.registerTool(
           trackIndexed(Buffer.byteLength(output));
           return trackResponse("execute_file", {
             content: [
-              { type: "text" as const, text: intentSearch(output, intent, `file:${path}:error`) },
+              { type: "text" as const, text: await intentSearch(output, intent, `file:${path}:error`) },
             ],
             isError: true,
           });
@@ -500,7 +524,7 @@ server.registerTool(
         trackIndexed(Buffer.byteLength(stdout));
         return trackResponse("execute_file", {
           content: [
-            { type: "text" as const, text: intentSearch(stdout, intent, `file:${path}`) },
+            { type: "text" as const, text: await intentSearch(stdout, intent, `file:${path}`) },
           ],
         });
       }
@@ -531,8 +555,9 @@ server.registerTool(
   {
     title: "Index Content",
     description:
-      "Index documentation or knowledge content into a searchable BM25 knowledge base. " +
-      "Chunks markdown by headings (keeping code blocks intact) and stores in ephemeral FTS5 database. " +
+      "Index documentation or knowledge content into a searchable hybrid knowledge base (BM25 + semantic). " +
+      "When QMD is running, uses vector embeddings and reranking for higher-quality results; otherwise falls back to local FTS5. " +
+      "Chunks markdown by headings (keeping code blocks intact). " +
       "The full content does NOT stay in context — only a brief summary is returned.\n\n" +
       "WHEN TO USE:\n" +
       "- Documentation from Context7, Skills, or MCP tools (API docs, framework guides, code examples)\n" +
@@ -578,16 +603,42 @@ server.registerTool(
     }
 
     try {
-      // Track the raw bytes being indexed (content or file)
-      if (content) trackIndexed(Buffer.byteLength(content));
-      else if (path) {
-        try {
-          const fs = await import("fs");
-          trackIndexed(fs.readFileSync(path).byteLength);
-        } catch { /* ignore — file read errors handled by store */ }
+      // Resolve content from file path if needed
+      let indexContent = content;
+      if (!indexContent && path) {
+        const fs = await import("fs");
+        indexContent = fs.readFileSync(path, "utf-8");
       }
+      if (!indexContent) {
+        return trackResponse("index", {
+          content: [{ type: "text" as const, text: "Error: No content to index" }],
+          isError: true,
+        });
+      }
+
+      trackIndexed(Buffer.byteLength(indexContent));
+      const label = source ?? path ?? "inline";
+
+      // QMD path
+      if (qmdAvailable) {
+        try {
+          const result = await qmdClient.index(indexContent, label);
+          return trackResponse("index", {
+            content: [
+              {
+                type: "text" as const,
+                text: `Indexed from: ${label}\nUse search(queries: ["..."]) to query this content.`,
+              },
+            ],
+          });
+        } catch (err) {
+          console.error("QMD index failed, falling back to local:", err);
+        }
+      }
+
+      // Fallback: local FTS5 store
       const store = getStore();
-      const result = store.index({ content, path, source });
+      const result = store.index({ content: indexContent, source: label });
 
       return trackResponse("index", {
         content: [
@@ -626,7 +677,7 @@ server.registerTool(
     title: "Search Indexed Content",
     description:
       "Search indexed content. Pass ALL search questions as queries array in ONE call.\n\n" +
-      "TIPS: 2-4 specific terms per query. Use 'source' to scope results.",
+      "TIPS: Natural language queries work well (e.g. 'how does authentication work'). Keyword queries also work. Use 'source' to scope results.",
     inputSchema: z.object({
       queries: z
         .array(z.string())
@@ -645,7 +696,6 @@ server.registerTool(
   },
   async (params) => {
     try {
-      const store = getStore();
       const raw = params as Record<string, unknown>;
 
       // Normalize: accept both query (string) and queries (array)
@@ -665,7 +715,63 @@ server.registerTool(
 
       const { limit = 3, source } = params as { limit?: number; source?: string };
 
-      // Progressive throttling: track calls in time window
+      // QMD path: hybrid search (BM25 + vector + RRF + reranking).
+      // No progressive throttling — QMD's reranking produces higher-quality
+      // results per query, and the per-query round-trip already discourages
+      // excessive calls more naturally than the local FTS5 path.
+      if (qmdAvailable) {
+        try {
+          const MAX_TOTAL = 40 * 1024;
+          let totalSize = 0;
+          const sections: string[] = [];
+
+          // Issue one search per query for proper attribution
+          for (const q of queryList) {
+            if (totalSize > MAX_TOTAL) {
+              sections.push(`## ${q}\n(output cap reached)\n`);
+              continue;
+            }
+
+            let qResults = await qmdClient.search([q], { limit });
+
+            // Client-side source filtering (QMD scopes to session collection,
+            // but source filters within it by document path)
+            if (source && qResults.length > 0) {
+              const sourceLower = source.toLowerCase();
+              qResults = qResults.filter(r =>
+                r.file.toLowerCase().includes(sourceLower)
+              );
+            }
+
+            if (qResults.length === 0) {
+              sections.push(`## ${q}\nNo results found.`);
+              continue;
+            }
+
+            const formatted = qResults
+              .map(r => {
+                const header = `--- [${r.file}] ---`;
+                const heading = `### ${r.title}`;
+                return `${header}\n${heading}\n\n${r.snippet}`;
+              })
+              .join("\n\n");
+
+            sections.push(`## ${q}\n\n${formatted}`);
+            totalSize += formatted.length;
+          }
+
+          const output = sections.join("\n\n---\n\n");
+          return trackResponse("search", {
+            content: [{ type: "text" as const, text: output || "No results found." }],
+          });
+        } catch (err) {
+          console.error("QMD search failed, falling back to local:", err);
+        }
+      }
+
+      // Fallback: local FTS5 store with progressive throttling
+      const store = getStore();
+
       const now = Date.now();
       if (now - searchWindowStart > SEARCH_WINDOW_MS) {
         searchCallCount = 0;
@@ -673,7 +779,6 @@ server.registerTool(
       }
       searchCallCount++;
 
-      // After SEARCH_BLOCK_AFTER calls: refuse
       if (searchCallCount > SEARCH_BLOCK_AFTER) {
         return trackResponse("search", {
           content: [{
@@ -686,12 +791,11 @@ server.registerTool(
         });
       }
 
-      // Determine per-query result limit based on throttle level
       const effectiveLimit = searchCallCount > SEARCH_MAX_RESULTS_AFTER
-        ? 1 // after 3 calls: only 1 result per query
-        : Math.min(limit, 2); // normal: max 2
+        ? 1
+        : Math.min(limit, 2);
 
-      const MAX_TOTAL = 40 * 1024; // 40KB total cap
+      const MAX_TOTAL = 40 * 1024;
       let totalSize = 0;
       const sections: string[] = [];
 
@@ -709,7 +813,7 @@ server.registerTool(
         }
 
         const formatted = results
-          .map((r, i) => {
+          .map((r) => {
             const header = `--- [${r.source}] ---`;
             const heading = `### ${r.title}`;
             const snippet = extractSnippet(r.content, q, 1500, r.highlighted);
@@ -723,7 +827,6 @@ server.registerTool(
 
       let output = sections.join("\n\n---\n\n");
 
-      // Add throttle warning after threshold
       if (searchCallCount >= SEARCH_MAX_RESULTS_AFTER) {
         output += `\n\n⚠ search call #${searchCallCount}/${SEARCH_BLOCK_AFTER} in this window. ` +
           `Results limited to ${effectiveLimit}/query. ` +
@@ -807,7 +910,7 @@ server.registerTool(
   {
     title: "Fetch & Index URL",
     description:
-      "Fetches URL content, converts HTML to markdown, indexes into searchable knowledge base, " +
+      "Fetches URL content, converts HTML to markdown, indexes into hybrid search backend, " +
       "and returns a ~3KB preview. Full content stays in sandbox — use search() for deeper lookups.\n\n" +
       "Better than WebFetch: preview is immediate, full content is searchable, raw HTML never enters context.",
     inputSchema: z.object({
@@ -854,11 +957,9 @@ server.registerTool(
         });
       }
 
-      // Index the markdown into FTS5
-      const store = getStore();
       const markdown = result.stdout.trim();
       trackIndexed(Buffer.byteLength(markdown));
-      const indexed = store.index({ content: markdown, source: source ?? url });
+      const label = source ?? url;
 
       // Build preview — first ~3KB of markdown for immediate use
       const PREVIEW_LIMIT = 3072;
@@ -866,6 +967,31 @@ server.registerTool(
         ? markdown.slice(0, PREVIEW_LIMIT) + "\n\n…[truncated — use search() for full content]"
         : markdown;
       const totalKB = (Buffer.byteLength(markdown) / 1024).toFixed(1);
+
+      // QMD path
+      if (qmdAvailable) {
+        try {
+          const indexResult = await qmdClient.index(markdown, label);
+          const text = [
+            `Fetched and indexed (${totalKB}KB) from: ${label}`,
+            `Full content indexed — use search(queries: [...]) for specific lookups.`,
+            "",
+            "---",
+            "",
+            preview,
+          ].join("\n");
+
+          return trackResponse("fetch_and_index", {
+            content: [{ type: "text" as const, text }],
+          });
+        } catch (err) {
+          console.error("QMD index failed in fetch_and_index, falling back to local:", err);
+        }
+      }
+
+      // Fallback: local FTS5 store
+      const store = getStore();
+      const indexed = store.index({ content: markdown, source: label });
 
       const text = [
         `Fetched and indexed **${indexed.totalChunks} sections** (${totalKB}KB) from: ${indexed.label}`,
@@ -970,18 +1096,69 @@ server.registerTool(
       const totalBytes = Buffer.byteLength(stdout);
       const totalLines = stdout.split("\n").length;
 
-      // Track indexed bytes (raw data that stays in sandbox)
       trackIndexed(totalBytes);
 
-      // Index into knowledge base — markdown heading chunking splits by # labels
-      const store = getStore();
       const source = `batch:${commands
         .map((c) => c.label)
         .join(",")
         .slice(0, 80)}`;
+
+      // QMD path: index + search via hybrid pipeline
+      if (qmdAvailable) {
+        try {
+          const indexResult = await qmdClient.index(stdout, source);
+
+          // Scope searches to just-indexed document
+          const sourceLower = source.toLowerCase();
+
+          const MAX_OUTPUT = 80 * 1024;
+          const queryResults: string[] = [];
+          let outputSize = 0;
+
+          // Issue one search per query for proper attribution
+          for (const query of queries) {
+            if (outputSize > MAX_OUTPUT) {
+              queryResults.push(`## ${query}\n(output cap reached)\n`);
+              continue;
+            }
+
+            const qResults = (await qmdClient.search([query], { limit: 3 }))
+              .filter(r => r.file.toLowerCase().includes(sourceLower));
+
+            queryResults.push(`## ${query}`);
+            queryResults.push("");
+            if (qResults.length > 0) {
+              for (const r of qResults) {
+                queryResults.push(`### ${r.title}`);
+                queryResults.push(r.snippet);
+                queryResults.push("");
+                outputSize += r.snippet.length + r.title.length;
+              }
+            } else {
+              queryResults.push("No matching sections found.");
+              queryResults.push("");
+            }
+          }
+
+          const output = [
+            `Executed ${commands.length} commands (${totalLines} lines, ${(totalBytes / 1024).toFixed(1)}KB). ` +
+              `Indexed into QMD. Searched ${queries.length} queries.`,
+            "",
+            ...queryResults,
+          ].join("\n");
+
+          return trackResponse("batch_execute", {
+            content: [{ type: "text" as const, text: output }],
+          });
+        } catch (err) {
+          console.error("QMD batch_execute failed, falling back to local:", err);
+        }
+      }
+
+      // Fallback: local FTS5 store
+      const store = getStore();
       const indexed = store.index({ content: stdout, source });
 
-      // Build section inventory — direct query by source_id (no FTS5 MATCH needed)
       const allSections = store.getChunksBySource(indexed.sourceId);
       const inventory: string[] = ["## Indexed Sections", ""];
       const sectionTitles: string[] = [];
@@ -991,9 +1168,7 @@ server.registerTool(
         sectionTitles.push(s.title);
       }
 
-      // Run all search queries — 3 results each, smart snippets
-      // Three-tier fallback: scoped → boosted → global
-      const MAX_OUTPUT = 80 * 1024; // 80KB total output cap
+      const MAX_OUTPUT = 80 * 1024;
       const queryResults: string[] = [];
       let outputSize = 0;
 
@@ -1003,10 +1178,8 @@ server.registerTool(
           continue;
         }
 
-        // Tier 1: scoped search with fallback (porter → trigram → fuzzy)
         let results = store.searchWithFallback(query, 3, source);
 
-        // Tier 2: global fallback (no source filter)
         if (results.length === 0) {
           results = store.searchWithFallback(query, 3);
         }
@@ -1027,7 +1200,6 @@ server.registerTool(
         }
       }
 
-      // Get searchable terms for edge cases where follow-up is needed
       const distinctiveTerms = store.getDistinctiveTerms
         ? store.getDistinctiveTerms(indexed.sourceId)
         : [];
@@ -1088,7 +1260,7 @@ server.registerTool(
     const uptimeMs = Date.now() - sessionStats.sessionStart;
     const uptimeMin = (uptimeMs / 60_000).toFixed(1);
 
-    // Total data kept out of context = indexed (FTS5) + sandboxed (network I/O inside sandbox)
+    // Total data kept out of context = indexed (QMD/FTS5) + sandboxed (network I/O inside sandbox)
     const keptOut = sessionStats.bytesIndexed + sessionStats.bytesSandboxed;
     const totalProcessed = keptOut + totalBytesReturned;
     const savingsRatio = totalProcessed / Math.max(totalBytesReturned, 1);
@@ -1165,13 +1337,25 @@ async function main() {
     console.error(`Cleaned up ${cleaned} stale DB file(s) from previous sessions`);
   }
 
-  // Clean up own DB on shutdown
-  const shutdown = () => {
+  // Check QMD availability
+  qmdAvailable = await qmdClient.isAvailable();
+  if (qmdAvailable) {
+    console.error(`QMD hybrid search available at ${QMD_URL} (session: ${qmdSessionId})`);
+  } else {
+    console.error(`QMD not available at ${QMD_URL} — using local FTS5 search`);
+  }
+
+  // Clean up on shutdown: flush QMD session + local DB
+  const shutdown = async () => {
+    if (qmdAvailable) {
+      try { await qmdClient.flush(); } catch {}
+    }
     if (_store) _store.cleanup();
   };
-  process.on("exit", shutdown);
-  process.on("SIGINT", () => { shutdown(); process.exit(0); });
-  process.on("SIGTERM", () => { shutdown(); process.exit(0); });
+  // 'exit' handler is sync — only local cleanup works here
+  process.on("exit", () => { if (_store) _store.cleanup(); });
+  process.on("SIGINT", async () => { await shutdown(); process.exit(0); });
+  process.on("SIGTERM", async () => { await shutdown(); process.exit(0); });
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
